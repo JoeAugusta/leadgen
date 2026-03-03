@@ -14,77 +14,63 @@ from googleapiclient.discovery import build as gbuild
 # =========================================
 # CONFIG
 # =========================================
-SHEET_NAME = "Pipeline"  # must match your Google Sheet tab name exactly
+SHEET_NAME = "Pipeline"
 
-# Common Crawl discovery limits
 CC_LIMIT_PER_QUERY = 250
-
-# How many new candidate homepages to try per run
-MAX_DTC_DOMAINS = 140
+MAX_DTC_DOMAINS = 120
 MAX_AGENCY_DOMAINS = 120
 
-# Throttling
 SLEEP_SEC = 0.45
 
-# Retry behavior for transient CC issues
 CC_MAX_RETRIES = 4
 CC_BACKOFF_BASE_SEC = 1.35
 CC_JITTER_SEC = 0.5
 
-# Default pipeline values
 DEFAULT_STAGE = "Lead Identified"
-DEFAULT_PROBABILITY_PCT = 10
 DEFAULT_FOLLOW_UP_STATUS = "Not Started"
 DEFAULT_PERSONA_DEPTH = "Low"
-
-DEFAULT_DEAL_SIZE_DTC = 9500
-DEFAULT_DEAL_SIZE_AGENCY = 9500
 
 BAD_DOMAINS = {
     "facebook.com", "instagram.com", "tiktok.com", "twitter.com", "x.com",
     "linkedin.com", "youtube.com", "pinterest.com", "snapchat.com", "reddit.com",
-    "google.com", "shop.app", "apps.apple.com", "play.google.com"
+    "google.com", "shop.app", "apps.apple.com", "play.google.com",
+    "webflow.com", "wixsite.com", "squarespace.com"
 }
 
-# Directory sites to discover agencies from
 AGENCY_DIRECTORY_PREFIXES = [
     "https://clutch.co/agencies",
     "https://themanifest.com",
     "https://www.designrush.com/agency",
     "https://sortlist.com",
-    "https://agencyspotter.com",
 ]
 
 # =========================================
-# SIGNALS + SCORING
+# SIGNALS / HEURISTICS
 # =========================================
-SIGNALS = {
-    "shopify": re.compile(r"shopify|cdn\.shopify\.com|myshopify\.com", re.I),
-    "woocommerce": re.compile(r"woocommerce", re.I),
-    "bigcommerce": re.compile(r"bigcommerce", re.I),
+SHOPIFY_RE = re.compile(r"cdn\.shopify\.com|myshopify\.com|Shopify", re.I)
+PASSWORD_RE = re.compile(r"password|enter store using password|opening soon", re.I)
 
+SIGNALS = {
     "meta_pixel": re.compile(r"connect\.facebook\.net|fbq\(", re.I),
     "tiktok_pixel": re.compile(r"tiktok.*pixel|ttq\(", re.I),
     "google_tag": re.compile(r"googletagmanager\.com|gtag\(", re.I),
-
     "klaviyo": re.compile(r"klaviyo", re.I),
     "attentive": re.compile(r"attentive", re.I),
     "postscript": re.compile(r"postscript", re.I),
-
     "triplewhale": re.compile(r"triplewhale", re.I),
     "northbeam": re.compile(r"northbeam", re.I),
-
     "recharge": re.compile(r"recharge", re.I),
 }
 
-AGENCY_KEYWORDS = [
-    r"case studies", r"clients", r"portfolio", r"results", r"testimonials",
-    r"paid social", r"meta ads", r"facebook ads", r"tiktok ads",
-    r"ecommerce", r"shopify", r"dtc", r"performance marketing",
-    r"creative strategy", r"ugc", r"creative testing"
-]
+AGENCY_KEYWORDS = re.compile(
+    r"(case studies|portfolio|clients|results|testimonials|paid social|meta ads|facebook ads|tiktok ads|"
+    r"performance marketing|creative strategy|ugc|creative testing|ecommerce marketing|shopify agency|dtc)",
+    re.I
+)
 
-
+# =========================================
+# Helpers
+# =========================================
 def norm_domain(url: str) -> str:
     try:
         host = urlparse(url).netloc.lower().replace("www.", "")
@@ -103,7 +89,7 @@ def fetch_html(url: str, timeout=20) -> str:
         r = requests.get(
             url,
             timeout=timeout,
-            headers={"User-Agent": "Mozilla/5.0 (compatible; AP-LeadGen/1.0)"},
+            headers={"User-Agent": "Mozilla/5.0 (compatible; AP-LeadGen/1.1)"},
             allow_redirects=True,
         )
         if r.status_code >= 400:
@@ -117,48 +103,56 @@ def detect_signals(html: str) -> dict:
     return {k: bool(rx.search(html)) for k, rx in SIGNALS.items()}
 
 
-def score_dtc(sig: dict) -> int:
-    score = 0
-    score += 3 if sig["shopify"] else 0
-    score += 2 if sig["meta_pixel"] else 0
-    score += 2 if sig["tiktok_pixel"] else 0
-    score += 1 if sig["google_tag"] else 0
-    score += 1 if sig["klaviyo"] else 0
-    score += 1 if sig["attentive"] else 0
-    score += 1 if sig["postscript"] else 0
-    score += 1 if sig["triplewhale"] else 0
-    score += 1 if sig["northbeam"] else 0
-    score += 1 if sig["recharge"] else 0
-    score += 1 if sig["woocommerce"] else 0
-    score += 1 if sig["bigcommerce"] else 0
-    return score
+def score_signal_count(sig: dict) -> int:
+    return sum(1 for v in sig.values() if v)
 
 
-def score_agency(html: str) -> int:
-    score = 0
-    if re.search(r"case studies|portfolio|clients|results", html, re.I):
-        score += 3
-    if re.search(r"paid social|meta ads|facebook ads|tiktok ads", html, re.I):
-        score += 3
-    if re.search(r"shopify|ecommerce|dtc", html, re.I):
-        score += 2
-    if re.search(r"creative strategy|ugc|creative testing", html, re.I):
-        score += 1
-    if re.search(r"scale|scaling|growth", html, re.I):
-        score += 1
-    return score
+def extract_canonical_domain(html: str) -> str | None:
+    """
+    Try to get real storefront domain from canonical or og:url
+    """
+    m = re.search(r'<link[^>]+rel=["\']canonical["\'][^>]+href=["\']([^"\']+)["\']', html, re.I)
+    if m:
+        return norm_domain(m.group(1))
+
+    m = re.search(r'<meta[^>]+property=["\']og:url["\'][^>]+content=["\']([^"\']+)["\']', html, re.I)
+    if m:
+        return norm_domain(m.group(1))
+
+    return None
 
 
-def infer_budget_fit(score: int) -> str:
-    if score >= 7:
-        return "High"
-    if score >= 4:
-        return "Med"
-    return "Low"
+def is_legit_dtc_store(domain: str, html: str) -> tuple[bool, str]:
+    """
+    Quality filter for DTC:
+    - must be Shopify-like
+    - must NOT be password/opening soon
+    - must NOT be a bare myshopify.com domain as the public site
+    - must have at least one additional marketing/commerce signal (pixel/klaviyo/etc)
+    """
+    if not html:
+        return False, "no_html"
+
+    if not SHOPIFY_RE.search(html):
+        return False, "not_shopify"
+
+    if PASSWORD_RE.search(html):
+        return False, "password_or_coming_soon"
+
+    # If the actual site is a myshopify subdomain, it's very often dev/test
+    if domain.endswith(".myshopify.com"):
+        return False, "myshopify_subdomain"
+
+    sig = detect_signals(html)
+    sig_count = score_signal_count(sig)
+    if sig_count < 1:
+        return False, "no_tracking_signals"
+
+    return True, f"signals={sig_count}"
 
 
 # =========================================
-# GOOGLE SHEETS
+# Google Sheets
 # =========================================
 def sheets_client(sa_json: dict):
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
@@ -167,7 +161,7 @@ def sheets_client(sa_json: dict):
 
 
 def get_existing_domains(svc, sheet_id: str) -> set:
-    rng = f"{SHEET_NAME}!C2:C"  # Website column
+    rng = f"{SHEET_NAME}!C2:C"
     resp = svc.spreadsheets().values().get(spreadsheetId=sheet_id, range=rng).execute()
     vals = resp.get("values", [])
     domains = set()
@@ -202,77 +196,46 @@ def row_for_pipeline(
     media_buyer_inhouse: str,
     budget_fit: str,
     stage: str,
-    deal_size: int,
-    probability_pct: int,
-    first_contact_date: str,
-    last_contact_date: str,
-    next_follow_up_date: str,
     notes: str,
     follow_up_status: str
 ):
     """
-    EXACT mapping to your headers (A..Y):
-
-    A  Lead Type (DTC / Agency)
-    B  Company Name
-    C  Website
-    D  Primary Contact
-    E  Title
-    F  Email
-    G  LinkedIn
-    H  Estimated Monthly Ad Spend
-    I  Estimated Revenue
-    J  Current Creative Style
-    K  Observed Weakness
-    L  Persona Depth (Low/Med/High)
-    M  Current Agency? (Y/N)
-    N  Media Buyer In-House? (Y/N)
-    O  Budget Fit (High/Med/Low)
-    P  Stage
-    Q  Deal Size ($)
-    R  Probability %
-    S  Weighted Value ($)
-    T  First Contact Date
-    U  Last Contact Date
-    V  Next Follow-Up Date
-    W  Days in Stage
-    X  Notes
-    Y  Follow-Up Status
+    Your headers A..Y.
+    Per your request: Q..V should be blank.
     """
-    weighted_value = round((deal_size or 0) * (probability_pct or 0) / 100)
-    days_in_stage = ""  # recommend formula in sheet
-
     return [
-        lead_type,                    # A
-        company[:120],                # B
-        website,                      # C
-        "",                           # D
-        "",                           # E
-        "",                           # F
-        "",                           # G
-        "",                           # H
-        "",                           # I
-        current_creative_style[:250], # J
-        observed_weakness[:250],      # K
-        persona_depth,                # L
-        current_agency,               # M
-        media_buyer_inhouse,          # N
-        budget_fit,                   # O
-        stage,                        # P
-        deal_size,                    # Q
-        probability_pct,              # R
-        weighted_value,               # S
-        first_contact_date,           # T
-        last_contact_date,            # U
-        next_follow_up_date,          # V
-        days_in_stage,                # W
-        notes[:700],                  # X
-        follow_up_status              # Y
+        lead_type,                    # A Lead Type
+        company[:120],                # B Company Name
+        website,                      # C Website
+        "",                           # D Primary Contact
+        "",                           # E Title
+        "",                           # F Email
+        "",                           # G LinkedIn
+        "",                           # H Estimated Monthly Ad Spend
+        "",                           # I Estimated Revenue
+        current_creative_style[:250], # J Current Creative Style
+        observed_weakness[:250],      # K Observed Weakness
+        persona_depth,                # L Persona Depth
+        current_agency,               # M Current Agency? (Y/N)
+        media_buyer_inhouse,          # N Media Buyer In-House? (Y/N)
+        budget_fit,                   # O Budget Fit
+        stage,                        # P Stage
+
+        "",                           # Q Deal Size ($)  <-- BLANK
+        "",                           # R Probability %  <-- BLANK
+        "",                           # S Weighted Value ($) <-- BLANK
+        "",                           # T First Contact Date <-- BLANK
+        "",                           # U Last Contact Date <-- BLANK
+        "",                           # V Next Follow-Up Date <-- BLANK
+
+        "",                           # W Days in Stage (formula recommended)
+        notes[:700],                  # X Notes
+        follow_up_status              # Y Follow-Up Status
     ]
 
 
 # =========================================
-# COMMON CRAWL (correct 404 behavior + retries for transient errors)
+# Common Crawl (404 = empty results)
 # =========================================
 def cc_latest_index_id() -> str:
     r = requests.get("https://index.commoncrawl.org/collinfo.json", timeout=25)
@@ -287,7 +250,7 @@ def request_with_retries(url: str, params: dict, timeout: int):
         try:
             r = requests.get(url, params=params, timeout=timeout)
 
-            # 404 from CC index means "no results" for that query, not a real failure
+            # 404 means "no results"
             if r.status_code == 404:
                 return r
 
@@ -305,28 +268,19 @@ def request_with_retries(url: str, params: dict, timeout: int):
             print(f"[CC] error attempt {attempt}/{CC_MAX_RETRIES} for {params.get('url')}: {e}; sleep {backoff:.2f}s")
             time.sleep(backoff)
 
-    # if we got here, give up (treat as empty results)
-    print(f"[CC] giving up on query after retries: {params.get('url')}")
     return None
 
 
-def cc_search_prefix(index_id: str, prefix_url: str, limit: int = 200) -> list[str]:
-    """
-    Search CC index by URL prefix.
-    """
+def cc_search_wild(index_id: str, wild_pattern: str, limit: int = 200) -> list[str]:
     endpoint = f"https://index.commoncrawl.org/{index_id}-index"
     params = {
-        "url": prefix_url,
-        "matchType": "prefix",
+        "url": wild_pattern,
         "output": "json",
         "limit": str(limit),
         "collapse": "urlkey",
     }
-
     r = request_with_retries(endpoint, params=params, timeout=45)
-    if r is None:
-        return []
-    if r.status_code == 404:
+    if r is None or r.status_code == 404:
         return []
 
     urls = []
@@ -341,23 +295,17 @@ def cc_search_prefix(index_id: str, prefix_url: str, limit: int = 200) -> list[s
     return urls
 
 
-def cc_search_wild(index_id: str, wild_pattern: str, limit: int = 200) -> list[str]:
-    """
-    CC index supports wildcard patterns in some cases (like *.myshopify.com/*).
-    We keep this only for DTC where it already works.
-    """
+def cc_search_prefix(index_id: str, prefix_url: str, limit: int = 200) -> list[str]:
     endpoint = f"https://index.commoncrawl.org/{index_id}-index"
     params = {
-        "url": wild_pattern,
+        "url": prefix_url,
+        "matchType": "prefix",
         "output": "json",
         "limit": str(limit),
         "collapse": "urlkey",
     }
-
     r = request_with_retries(endpoint, params=params, timeout=45)
-    if r is None:
-        return []
-    if r.status_code == 404:
+    if r is None or r.status_code == 404:
         return []
 
     urls = []
@@ -373,8 +321,7 @@ def cc_search_wild(index_id: str, wild_pattern: str, limit: int = 200) -> list[s
 
 
 def homepages_from_urls(urls: list[str], max_domains: int) -> list[str]:
-    out = []
-    seen = set()
+    out, seen = [], set()
     for u in urls:
         d = norm_domain(u)
         if not d or d in seen:
@@ -389,33 +336,26 @@ def homepages_from_urls(urls: list[str], max_domains: int) -> list[str]:
 
 
 # =========================================
-# AGENCY EXTRACTION FROM DIRECTORY PAGES
+# Agency extraction from directory HTML
 # =========================================
 def extract_candidate_websites_from_html(html: str) -> set:
-    """
-    Heuristic extraction of candidate agency websites from directory pages.
-    We extract http(s) links, then filter out the directory domain + known socials.
-    """
     urls = set(re.findall(r'https?://[^\s"\'<>]+', html))
     cleaned = set()
 
     for u in urls:
-        # strip junk
-        u = u.split("#")[0]
-        u = u.split("?")[0]
+        u = u.split("#")[0].split("?")[0]
         d = norm_domain(u)
-        if not d:
-            continue
-        if d in BAD_DOMAINS:
-            continue
-        # ignore directory domains themselves
-        if any(d.endswith(norm_domain(p)) for p in AGENCY_DIRECTORY_PREFIXES):
-            continue
-        # ignore obvious tracking/outbound wrappers
-        if "googleadservices" in d or "doubleclick" in d:
+        if not d or d in BAD_DOMAINS:
             continue
 
-        # likely actual company site if TLD-ish and not the directory
+        # ignore the directory host itself
+        if any(d.endswith(norm_domain(p)) for p in AGENCY_DIRECTORY_PREFIXES):
+            continue
+
+        # ignore obvious outbound wrappers
+        if "clutch.co" in d or "themanifest.com" in d or "designrush.com" in d or "sortlist.com" in d:
+            continue
+
         cleaned.add(f"https://{d}/")
 
     return cleaned
@@ -431,99 +371,103 @@ def main():
     svc = sheets_client(sa_json)
     existing_domains = get_existing_domains(svc, sheet_id)
 
-    today = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d")
-    new_rows = []
-
     index_id = cc_latest_index_id()
     print(f"Using Common Crawl index: {index_id}")
 
-    def add_lead(lead_type: str, homepage_url: str):
+    new_rows = []
+
+    def add_dtc(homepage_url: str):
         nonlocal new_rows, existing_domains
 
         domain = norm_domain(homepage_url)
-        if not domain or domain in existing_domains:
-            return
-        if domain in BAD_DOMAINS:
+        if not domain or domain in existing_domains or domain in BAD_DOMAINS:
             return
 
         html = fetch_html(homepage_url)
         if not html:
             return
 
-        lead_id = stable_id(lead_type, domain)
+        # If canonical points to a better domain, switch to it
+        canon = extract_canonical_domain(html)
+        if canon and canon != domain and canon not in BAD_DOMAINS and not canon.endswith(".myshopify.com"):
+            homepage_url2 = f"https://{canon}/"
+            html2 = fetch_html(homepage_url2)
+            if html2:
+                homepage_url = homepage_url2
+                domain = canon
+                html = html2
 
-        persona_depth = DEFAULT_PERSONA_DEPTH
-        current_agency = ""         # unknown
-        media_buyer_inhouse = ""    # unknown
-        stage = DEFAULT_STAGE
-        probability_pct = DEFAULT_PROBABILITY_PCT
-        first_contact_date = today
-        last_contact_date = today
-        next_follow_up_date = ""
-        follow_up_status = DEFAULT_FOLLOW_UP_STATUS
+        ok, reason = is_legit_dtc_store(domain, html)
+        if not ok:
+            return
 
-        company = domain
+        sig = detect_signals(html)
+        sig_list = [k.replace("_", " ").title() for k, v in sig.items() if v]
+        current_creative_style = "Shopify + " + (", ".join(sig_list) if sig_list else "signals")
+        observed_weakness = "Needs scalable creative testing + fatigue prevention"
+        budget_fit = "Med"  # leave conservative; refine later with spend estimation
+        lead_id = stable_id("DTC", domain)
 
-        if lead_type == "DTC":
-            sig = detect_signals(html)
-            score = score_dtc(sig)
-
-            # keep open; you can tighten later
-            if score < 3:
-                return
-
-            observed = []
-            for k in [
-                "shopify", "woocommerce", "bigcommerce",
-                "meta_pixel", "tiktok_pixel", "google_tag",
-                "klaviyo", "attentive", "postscript",
-                "triplewhale", "northbeam", "recharge"
-            ]:
-                if sig.get(k):
-                    observed.append(k.replace("_", " ").title())
-
-            current_creative_style = ", ".join(observed) if observed else "Ecommerce stack detected"
-            observed_weakness = "Likely needs scalable creative testing + fatigue prevention"
-            deal_size = DEFAULT_DEAL_SIZE_DTC
-            budget_fit = infer_budget_fit(score)
-            notes = f"Score={score} | id={lead_id} | domain={domain}"
-
-        else:
-            score = score_agency(html)
-            if score < 4:
-                return
-
-            hits = []
-            for kw in AGENCY_KEYWORDS:
-                if re.search(kw, html, re.I):
-                    hits.append(re.sub(r"\W+", " ", kw).strip()[:28])
-                if len(hits) >= 6:
-                    break
-
-            current_creative_style = "Agency Signals: " + ", ".join(hits) if hits else "Agency site detected"
-            observed_weakness = "Agency: potential creative partner (overflow creative system)"
-            deal_size = DEFAULT_DEAL_SIZE_AGENCY
-            budget_fit = infer_budget_fit(score)
-            notes = f"Score={score} | id={lead_id} | domain={domain}"
+        notes = f"id={lead_id} | domain={domain} | {reason}"
 
         row = row_for_pipeline(
-            lead_type=lead_type,
-            company=company,
+            lead_type="DTC",
+            company=domain,
             website=homepage_url,
             current_creative_style=current_creative_style,
             observed_weakness=observed_weakness,
-            persona_depth=persona_depth,
-            current_agency=current_agency,
-            media_buyer_inhouse=media_buyer_inhouse,
+            persona_depth=DEFAULT_PERSONA_DEPTH,
+            current_agency="",
+            media_buyer_inhouse="",
             budget_fit=budget_fit,
-            stage=stage,
-            deal_size=deal_size,
-            probability_pct=probability_pct,
-            first_contact_date=first_contact_date,
-            last_contact_date=last_contact_date,
-            next_follow_up_date=next_follow_up_date,
+            stage=DEFAULT_STAGE,
             notes=notes,
-            follow_up_status=follow_up_status
+            follow_up_status=DEFAULT_FOLLOW_UP_STATUS
+        )
+
+        new_rows.append(row)
+        existing_domains.add(domain)
+        time.sleep(SLEEP_SEC)
+
+    def add_agency(homepage_url: str):
+        nonlocal new_rows, existing_domains
+
+        domain = norm_domain(homepage_url)
+        if not domain or domain in existing_domains or domain in BAD_DOMAINS:
+            return
+
+        html = fetch_html(homepage_url)
+        if not html:
+            return
+
+        # Validate as agency
+        if not AGENCY_KEYWORDS.search(html):
+            return
+
+        # Build style/weakness notes
+        hits = []
+        for kw in ["case studies", "portfolio", "clients", "paid social", "meta ads", "tiktok ads", "creative strategy", "ugc"]:
+            if re.search(kw, html, re.I):
+                hits.append(kw)
+        current_creative_style = "Agency: " + (", ".join(hits) if hits else "marketing services")
+        observed_weakness = "Potential partner: creative overflow + testing system"
+        budget_fit = "Med"
+        lead_id = stable_id("Agency", domain)
+        notes = f"id={lead_id} | domain={domain} | source=directory"
+
+        row = row_for_pipeline(
+            lead_type="Agency",
+            company=domain,
+            website=homepage_url,
+            current_creative_style=current_creative_style,
+            observed_weakness=observed_weakness,
+            persona_depth=DEFAULT_PERSONA_DEPTH,
+            current_agency="",
+            media_buyer_inhouse="",
+            budget_fit=budget_fit,
+            stage=DEFAULT_STAGE,
+            notes=notes,
+            follow_up_status=DEFAULT_FOLLOW_UP_STATUS
         )
 
         new_rows.append(row)
@@ -531,25 +475,22 @@ def main():
         time.sleep(SLEEP_SEC)
 
     # -------------------------
-    # DTC Discovery (Shopify)
+    # DTC discovery (start from myshopify and convert to real domains)
     # -------------------------
-    dtc_seed_urls = []
-    dtc_seed_urls += cc_search_wild(index_id, "*.myshopify.com/*", limit=CC_LIMIT_PER_QUERY)
-
+    dtc_seed_urls = cc_search_wild(index_id, "*.myshopify.com/*", limit=CC_LIMIT_PER_QUERY)
     dtc_homepages = homepages_from_urls(dtc_seed_urls, max_domains=MAX_DTC_DOMAINS)
-    print(f"DTC candidate domains: {len(dtc_homepages)}")
+    print(f"DTC candidate domains (seeded): {len(dtc_homepages)}")
 
     for u in dtc_homepages:
-        add_lead("DTC", u)
+        add_dtc(u)
 
     # -------------------------
-    # Agency Discovery via directories (more reliable than guessing slugs)
+    # Agency discovery via directory pages
     # -------------------------
     dir_pages = []
     for prefix in AGENCY_DIRECTORY_PREFIXES:
         dir_pages += cc_search_prefix(index_id, prefix, limit=120)
 
-    # Dedup directory pages
     dir_pages = list(dict.fromkeys(dir_pages))[:180]
     print(f"Directory pages discovered: {len(dir_pages)}")
 
@@ -560,19 +501,16 @@ def main():
             continue
         candidate_agency_sites |= extract_candidate_websites_from_html(html)
         time.sleep(SLEEP_SEC)
-
-        if len(candidate_agency_sites) >= 600:
+        if len(candidate_agency_sites) >= 500:
             break
 
-    # Convert to a bounded list
     agency_homepages = list(candidate_agency_sites)
     random.shuffle(agency_homepages)
     agency_homepages = agency_homepages[:MAX_AGENCY_DOMAINS]
-
-    print(f"Agency candidate domains: {len(agency_homepages)}")
+    print(f"Agency candidate domains (extracted): {len(agency_homepages)}")
 
     for u in agency_homepages:
-        add_lead("Agency", u)
+        add_agency(u)
 
     # -------------------------
     # Write results
