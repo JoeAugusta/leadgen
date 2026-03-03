@@ -3,6 +3,7 @@ import json
 import re
 import time
 import hashlib
+import random
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
@@ -22,6 +23,11 @@ MAX_AGENCY_DOMAINS = 160
 
 # Throttling
 SLEEP_SEC = 0.45
+
+# Retry behavior (for Common Crawl instability)
+CC_MAX_RETRIES = 5
+CC_BACKOFF_BASE_SEC = 1.2  # exponential backoff base
+CC_JITTER_SEC = 0.4
 
 # Default pipeline values
 DEFAULT_STAGE = "Lead Identified"
@@ -135,19 +141,11 @@ def score_agency(html: str) -> int:
 
 
 def infer_budget_fit(lead_type: str, score: int) -> str:
-    # simple heuristic; refine later
-    if lead_type == "DTC":
-        if score >= 7:
-            return "High"
-        if score >= 4:
-            return "Med"
-        return "Low"
-    else:
-        if score >= 7:
-            return "High"
-        if score >= 4:
-            return "Med"
-        return "Low"
+    if score >= 7:
+        return "High"
+    if score >= 4:
+        return "Med"
+    return "Low"
 
 
 # =========================================
@@ -160,8 +158,7 @@ def sheets_client(sa_json: dict):
 
 
 def get_existing_domains(svc, sheet_id: str) -> set:
-    # Website is column C (per your headers)
-    rng = f"{SHEET_NAME}!C2:C"
+    rng = f"{SHEET_NAME}!C2:C"  # Website column
     resp = svc.spreadsheets().values().get(spreadsheetId=sheet_id, range=rng).execute()
     vals = resp.get("values", [])
     domains = set()
@@ -234,40 +231,67 @@ def row_for_pipeline(
     Y  Follow-Up Status
     """
     weighted_value = round((deal_size or 0) * (probability_pct or 0) / 100)
-    days_in_stage = ""  # better handled as a sheet formula
+    days_in_stage = ""  # recommend formula in sheet
 
     return [
-        lead_type,                   # A
-        company[:120],               # B
-        website,                     # C
-        "",                          # D
-        "",                          # E
-        "",                          # F
-        "",                          # G
-        "",                          # H
-        "",                          # I
-        current_creative_style[:250],# J
-        observed_weakness[:250],     # K
-        persona_depth,               # L
-        current_agency,              # M
-        media_buyer_inhouse,         # N
-        budget_fit,                  # O
-        stage,                       # P
-        deal_size,                   # Q
-        probability_pct,             # R
-        weighted_value,              # S
-        first_contact_date,          # T
-        last_contact_date,           # U
-        next_follow_up_date,         # V
-        days_in_stage,               # W
-        notes[:700],                 # X
-        follow_up_status             # Y
+        lead_type,                    # A
+        company[:120],                # B
+        website,                      # C
+        "",                           # D
+        "",                           # E
+        "",                           # F
+        "",                           # G
+        "",                           # H
+        "",                           # I
+        current_creative_style[:250], # J
+        observed_weakness[:250],      # K
+        persona_depth,                # L
+        current_agency,               # M
+        media_buyer_inhouse,          # N
+        budget_fit,                   # O
+        stage,                        # P
+        deal_size,                    # Q
+        probability_pct,              # R
+        weighted_value,               # S
+        first_contact_date,           # T
+        last_contact_date,            # U
+        next_follow_up_date,          # V
+        days_in_stage,                # W
+        notes[:700],                  # X
+        follow_up_status              # Y
     ]
 
 
 # =========================================
-# COMMON CRAWL DISCOVERY
+# COMMON CRAWL DISCOVERY (resilient)
 # =========================================
+def request_with_retries(url: str, params: dict, timeout: int):
+    """
+    Retries on transient status codes commonly seen from Common Crawl.
+    """
+    transient = {429, 500, 502, 503, 504}
+    last_err = None
+
+    for attempt in range(1, CC_MAX_RETRIES + 1):
+        try:
+            r = requests.get(url, params=params, timeout=timeout)
+            if r.status_code in transient:
+                backoff = (CC_BACKOFF_BASE_SEC ** attempt) + random.random() * CC_JITTER_SEC
+                print(f"[CC] transient {r.status_code} on attempt {attempt}/{CC_MAX_RETRIES} for {params.get('url')}; sleeping {backoff:.2f}s")
+                time.sleep(backoff)
+                last_err = f"HTTP {r.status_code}"
+                continue
+            r.raise_for_status()
+            return r
+        except Exception as e:
+            backoff = (CC_BACKOFF_BASE_SEC ** attempt) + random.random() * CC_JITTER_SEC
+            print(f"[CC] error on attempt {attempt}/{CC_MAX_RETRIES} for {params.get('url')}: {e}; sleeping {backoff:.2f}s")
+            time.sleep(backoff)
+            last_err = str(e)
+
+    raise requests.exceptions.HTTPError(f"Common Crawl request failed after retries: {last_err}")
+
+
 def cc_latest_index_id() -> str:
     r = requests.get("https://index.commoncrawl.org/collinfo.json", timeout=25)
     r.raise_for_status()
@@ -276,9 +300,6 @@ def cc_latest_index_id() -> str:
 
 
 def cc_search(index_id: str, url_pattern: str, limit: int = 250) -> list[str]:
-    """
-    Common Crawl index lookup by URL pattern.
-    """
     endpoint = f"https://index.commoncrawl.org/{index_id}-index"
     params = {
         "url": url_pattern,
@@ -286,10 +307,13 @@ def cc_search(index_id: str, url_pattern: str, limit: int = 250) -> list[str]:
         "limit": str(limit),
         "collapse": "urlkey",
     }
-    r = requests.get(endpoint, params=params, timeout=45)
-    if r.status_code == 404:
+
+    try:
+        r = request_with_retries(endpoint, params=params, timeout=45)
+    except Exception as e:
+        # Do NOT crash the whole run; just skip this query
+        print(f"[CC] skipping query due to repeated failure: pattern={url_pattern} err={e}")
         return []
-    r.raise_for_status()
 
     urls = []
     for line in r.text.splitlines():
@@ -348,7 +372,6 @@ def main():
         if not html:
             return
 
-        company = domain
         lead_id = stable_id(lead_type, domain)
 
         # Defaults
@@ -362,11 +385,13 @@ def main():
         next_follow_up_date = ""
         follow_up_status = DEFAULT_FOLLOW_UP_STATUS
 
+        company = domain
+
         if lead_type == "DTC":
             sig = detect_signals(html)
             score = score_dtc(sig)
 
-            # keep fairly open; tighten later
+            # Keep first runs open; tighten later
             if score < 3:
                 return
 
@@ -384,8 +409,8 @@ def main():
             observed_weakness = "Likely needs scalable creative testing + fatigue prevention"
             deal_size = DEFAULT_DEAL_SIZE_DTC
             budget_fit = infer_budget_fit("DTC", score)
-
             notes = f"Score={score} | id={lead_id} | domain={domain}"
+
         else:
             score = score_agency(html)
             if score < 4:
@@ -402,7 +427,6 @@ def main():
             observed_weakness = "Agency: potential creative partner (overflow creative system)"
             deal_size = DEFAULT_DEAL_SIZE_AGENCY
             budget_fit = infer_budget_fit("Agency", score)
-
             notes = f"Score={score} | id={lead_id} | domain={domain}"
 
         row = row_for_pipeline(
@@ -443,15 +467,18 @@ def main():
         consider_homepage("DTC", u)
 
     # -------------------------
-    # Agency Discovery (URL slug patterns)
+    # Agency Discovery (URL slug patterns; may be noisy, refine later)
     # -------------------------
     agency_seed_urls = []
-    agency_seed_urls += cc_search(index_id, "*case-studies*", limit=CC_LIMIT_PER_QUERY)
-    agency_seed_urls += cc_search(index_id, "*portfolio*", limit=CC_LIMIT_PER_QUERY)
-    agency_seed_urls += cc_search(index_id, "*paid-social*", limit=CC_LIMIT_PER_QUERY)
-    agency_seed_urls += cc_search(index_id, "*meta-ads*", limit=CC_LIMIT_PER_QUERY)
-    agency_seed_urls += cc_search(index_id, "*facebook-ads*", limit=CC_LIMIT_PER_QUERY)
-    agency_seed_urls += cc_search(index_id, "*tiktok-ads*", limit=CC_LIMIT_PER_QUERY)
+    for pattern in [
+        "*case-studies*",
+        "*portfolio*",
+        "*paid-social*",
+        "*meta-ads*",
+        "*facebook-ads*",
+        "*tiktok-ads*",
+    ]:
+        agency_seed_urls += cc_search(index_id, pattern, limit=CC_LIMIT_PER_QUERY)
 
     agency_homepages = homepages_from_urls(agency_seed_urls, max_domains=MAX_AGENCY_DOMAINS)
     print(f"Agency candidate domains: {len(agency_homepages)}")
