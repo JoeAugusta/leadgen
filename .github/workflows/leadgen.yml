@@ -17,8 +17,7 @@ jobs:
 
       - name: Install deps
         run: |
-          pip install requests google-api-python-client google-auth ddgs
-
+          pip install requests google-api-python-client google-auth
       - name: Run lead generator
         env:
           GSHEET_ID: ${{ secrets.GSHEET_ID }}
