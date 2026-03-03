@@ -17,17 +17,19 @@ from googleapiclient.discovery import build as gbuild
 SHEET_NAME = "Pipeline"  # must match your Google Sheet tab name exactly
 
 # Common Crawl discovery limits
-CC_LIMIT_PER_QUERY = 300
-MAX_DTC_DOMAINS = 160
-MAX_AGENCY_DOMAINS = 160
+CC_LIMIT_PER_QUERY = 250
+
+# How many new candidate homepages to try per run
+MAX_DTC_DOMAINS = 140
+MAX_AGENCY_DOMAINS = 120
 
 # Throttling
 SLEEP_SEC = 0.45
 
-# Retry behavior (for Common Crawl instability)
-CC_MAX_RETRIES = 5
-CC_BACKOFF_BASE_SEC = 1.2  # exponential backoff base
-CC_JITTER_SEC = 0.4
+# Retry behavior for transient CC issues
+CC_MAX_RETRIES = 4
+CC_BACKOFF_BASE_SEC = 1.35
+CC_JITTER_SEC = 0.5
 
 # Default pipeline values
 DEFAULT_STAGE = "Lead Identified"
@@ -35,16 +37,23 @@ DEFAULT_PROBABILITY_PCT = 10
 DEFAULT_FOLLOW_UP_STATUS = "Not Started"
 DEFAULT_PERSONA_DEPTH = "Low"
 
-# Default deal sizes (edit later if you want)
 DEFAULT_DEAL_SIZE_DTC = 9500
 DEFAULT_DEAL_SIZE_AGENCY = 9500
 
-# Block obvious non-lead domains
 BAD_DOMAINS = {
     "facebook.com", "instagram.com", "tiktok.com", "twitter.com", "x.com",
     "linkedin.com", "youtube.com", "pinterest.com", "snapchat.com", "reddit.com",
     "google.com", "shop.app", "apps.apple.com", "play.google.com"
 }
+
+# Directory sites to discover agencies from
+AGENCY_DIRECTORY_PREFIXES = [
+    "https://clutch.co/agencies",
+    "https://themanifest.com",
+    "https://www.designrush.com/agency",
+    "https://sortlist.com",
+    "https://agencyspotter.com",
+]
 
 # =========================================
 # SIGNALS + SCORING
@@ -89,7 +98,7 @@ def stable_id(lead_type: str, domain: str) -> str:
     return hashlib.sha1(raw).hexdigest()[:10]
 
 
-def fetch_html(url: str, timeout=18) -> str:
+def fetch_html(url: str, timeout=20) -> str:
     try:
         r = requests.get(
             url,
@@ -140,7 +149,7 @@ def score_agency(html: str) -> int:
     return score
 
 
-def infer_budget_fit(lead_type: str, score: int) -> str:
+def infer_budget_fit(score: int) -> str:
     if score >= 7:
         return "High"
     if score >= 4:
@@ -263,35 +272,8 @@ def row_for_pipeline(
 
 
 # =========================================
-# COMMON CRAWL DISCOVERY (resilient)
+# COMMON CRAWL (correct 404 behavior + retries for transient errors)
 # =========================================
-def request_with_retries(url: str, params: dict, timeout: int):
-    """
-    Retries on transient status codes commonly seen from Common Crawl.
-    """
-    transient = {429, 500, 502, 503, 504}
-    last_err = None
-
-    for attempt in range(1, CC_MAX_RETRIES + 1):
-        try:
-            r = requests.get(url, params=params, timeout=timeout)
-            if r.status_code in transient:
-                backoff = (CC_BACKOFF_BASE_SEC ** attempt) + random.random() * CC_JITTER_SEC
-                print(f"[CC] transient {r.status_code} on attempt {attempt}/{CC_MAX_RETRIES} for {params.get('url')}; sleeping {backoff:.2f}s")
-                time.sleep(backoff)
-                last_err = f"HTTP {r.status_code}"
-                continue
-            r.raise_for_status()
-            return r
-        except Exception as e:
-            backoff = (CC_BACKOFF_BASE_SEC ** attempt) + random.random() * CC_JITTER_SEC
-            print(f"[CC] error on attempt {attempt}/{CC_MAX_RETRIES} for {params.get('url')}: {e}; sleeping {backoff:.2f}s")
-            time.sleep(backoff)
-            last_err = str(e)
-
-    raise requests.exceptions.HTTPError(f"Common Crawl request failed after retries: {last_err}")
-
-
 def cc_latest_index_id() -> str:
     r = requests.get("https://index.commoncrawl.org/collinfo.json", timeout=25)
     r.raise_for_status()
@@ -299,20 +281,83 @@ def cc_latest_index_id() -> str:
     return data[0]["id"]
 
 
-def cc_search(index_id: str, url_pattern: str, limit: int = 250) -> list[str]:
+def request_with_retries(url: str, params: dict, timeout: int):
+    transient = {429, 500, 502, 503, 504}
+    for attempt in range(1, CC_MAX_RETRIES + 1):
+        try:
+            r = requests.get(url, params=params, timeout=timeout)
+
+            # 404 from CC index means "no results" for that query, not a real failure
+            if r.status_code == 404:
+                return r
+
+            if r.status_code in transient:
+                backoff = (CC_BACKOFF_BASE_SEC ** attempt) + random.random() * CC_JITTER_SEC
+                print(f"[CC] transient {r.status_code} attempt {attempt}/{CC_MAX_RETRIES} for {params.get('url')}; sleep {backoff:.2f}s")
+                time.sleep(backoff)
+                continue
+
+            r.raise_for_status()
+            return r
+
+        except Exception as e:
+            backoff = (CC_BACKOFF_BASE_SEC ** attempt) + random.random() * CC_JITTER_SEC
+            print(f"[CC] error attempt {attempt}/{CC_MAX_RETRIES} for {params.get('url')}: {e}; sleep {backoff:.2f}s")
+            time.sleep(backoff)
+
+    # if we got here, give up (treat as empty results)
+    print(f"[CC] giving up on query after retries: {params.get('url')}")
+    return None
+
+
+def cc_search_prefix(index_id: str, prefix_url: str, limit: int = 200) -> list[str]:
+    """
+    Search CC index by URL prefix.
+    """
     endpoint = f"https://index.commoncrawl.org/{index_id}-index"
     params = {
-        "url": url_pattern,
+        "url": prefix_url,
+        "matchType": "prefix",
         "output": "json",
         "limit": str(limit),
         "collapse": "urlkey",
     }
 
-    try:
-        r = request_with_retries(endpoint, params=params, timeout=45)
-    except Exception as e:
-        # Do NOT crash the whole run; just skip this query
-        print(f"[CC] skipping query due to repeated failure: pattern={url_pattern} err={e}")
+    r = request_with_retries(endpoint, params=params, timeout=45)
+    if r is None:
+        return []
+    if r.status_code == 404:
+        return []
+
+    urls = []
+    for line in r.text.splitlines():
+        try:
+            obj = json.loads(line)
+            u = obj.get("url")
+            if u:
+                urls.append(u)
+        except Exception:
+            continue
+    return urls
+
+
+def cc_search_wild(index_id: str, wild_pattern: str, limit: int = 200) -> list[str]:
+    """
+    CC index supports wildcard patterns in some cases (like *.myshopify.com/*).
+    We keep this only for DTC where it already works.
+    """
+    endpoint = f"https://index.commoncrawl.org/{index_id}-index"
+    params = {
+        "url": wild_pattern,
+        "output": "json",
+        "limit": str(limit),
+        "collapse": "urlkey",
+    }
+
+    r = request_with_retries(endpoint, params=params, timeout=45)
+    if r is None:
+        return []
+    if r.status_code == 404:
         return []
 
     urls = []
@@ -344,6 +389,39 @@ def homepages_from_urls(urls: list[str], max_domains: int) -> list[str]:
 
 
 # =========================================
+# AGENCY EXTRACTION FROM DIRECTORY PAGES
+# =========================================
+def extract_candidate_websites_from_html(html: str) -> set:
+    """
+    Heuristic extraction of candidate agency websites from directory pages.
+    We extract http(s) links, then filter out the directory domain + known socials.
+    """
+    urls = set(re.findall(r'https?://[^\s"\'<>]+', html))
+    cleaned = set()
+
+    for u in urls:
+        # strip junk
+        u = u.split("#")[0]
+        u = u.split("?")[0]
+        d = norm_domain(u)
+        if not d:
+            continue
+        if d in BAD_DOMAINS:
+            continue
+        # ignore directory domains themselves
+        if any(d.endswith(norm_domain(p)) for p in AGENCY_DIRECTORY_PREFIXES):
+            continue
+        # ignore obvious tracking/outbound wrappers
+        if "googleadservices" in d or "doubleclick" in d:
+            continue
+
+        # likely actual company site if TLD-ish and not the directory
+        cleaned.add(f"https://{d}/")
+
+    return cleaned
+
+
+# =========================================
 # MAIN
 # =========================================
 def main():
@@ -359,7 +437,7 @@ def main():
     index_id = cc_latest_index_id()
     print(f"Using Common Crawl index: {index_id}")
 
-    def consider_homepage(lead_type: str, homepage_url: str):
+    def add_lead(lead_type: str, homepage_url: str):
         nonlocal new_rows, existing_domains
 
         domain = norm_domain(homepage_url)
@@ -374,10 +452,9 @@ def main():
 
         lead_id = stable_id(lead_type, domain)
 
-        # Defaults
         persona_depth = DEFAULT_PERSONA_DEPTH
-        current_agency = ""            # unknown
-        media_buyer_inhouse = ""       # unknown
+        current_agency = ""         # unknown
+        media_buyer_inhouse = ""    # unknown
         stage = DEFAULT_STAGE
         probability_pct = DEFAULT_PROBABILITY_PCT
         first_contact_date = today
@@ -391,7 +468,7 @@ def main():
             sig = detect_signals(html)
             score = score_dtc(sig)
 
-            # Keep first runs open; tighten later
+            # keep open; you can tighten later
             if score < 3:
                 return
 
@@ -408,7 +485,7 @@ def main():
             current_creative_style = ", ".join(observed) if observed else "Ecommerce stack detected"
             observed_weakness = "Likely needs scalable creative testing + fatigue prevention"
             deal_size = DEFAULT_DEAL_SIZE_DTC
-            budget_fit = infer_budget_fit("DTC", score)
+            budget_fit = infer_budget_fit(score)
             notes = f"Score={score} | id={lead_id} | domain={domain}"
 
         else:
@@ -426,7 +503,7 @@ def main():
             current_creative_style = "Agency Signals: " + ", ".join(hits) if hits else "Agency site detected"
             observed_weakness = "Agency: potential creative partner (overflow creative system)"
             deal_size = DEFAULT_DEAL_SIZE_AGENCY
-            budget_fit = infer_budget_fit("Agency", score)
+            budget_fit = infer_budget_fit(score)
             notes = f"Score={score} | id={lead_id} | domain={domain}"
 
         row = row_for_pipeline(
@@ -454,40 +531,51 @@ def main():
         time.sleep(SLEEP_SEC)
 
     # -------------------------
-    # DTC Discovery (Shopify-heavy)
+    # DTC Discovery (Shopify)
     # -------------------------
     dtc_seed_urls = []
-    dtc_seed_urls += cc_search(index_id, "*.myshopify.com/*", limit=CC_LIMIT_PER_QUERY)
-    dtc_seed_urls += cc_search(index_id, "*cdn.shopify.com/*", limit=CC_LIMIT_PER_QUERY)
+    dtc_seed_urls += cc_search_wild(index_id, "*.myshopify.com/*", limit=CC_LIMIT_PER_QUERY)
 
     dtc_homepages = homepages_from_urls(dtc_seed_urls, max_domains=MAX_DTC_DOMAINS)
     print(f"DTC candidate domains: {len(dtc_homepages)}")
 
     for u in dtc_homepages:
-        consider_homepage("DTC", u)
+        add_lead("DTC", u)
 
     # -------------------------
-    # Agency Discovery (URL slug patterns; may be noisy, refine later)
+    # Agency Discovery via directories (more reliable than guessing slugs)
     # -------------------------
-    agency_seed_urls = []
-    for pattern in [
-        "*case-studies*",
-        "*portfolio*",
-        "*paid-social*",
-        "*meta-ads*",
-        "*facebook-ads*",
-        "*tiktok-ads*",
-    ]:
-        agency_seed_urls += cc_search(index_id, pattern, limit=CC_LIMIT_PER_QUERY)
+    dir_pages = []
+    for prefix in AGENCY_DIRECTORY_PREFIXES:
+        dir_pages += cc_search_prefix(index_id, prefix, limit=120)
 
-    agency_homepages = homepages_from_urls(agency_seed_urls, max_domains=MAX_AGENCY_DOMAINS)
+    # Dedup directory pages
+    dir_pages = list(dict.fromkeys(dir_pages))[:180]
+    print(f"Directory pages discovered: {len(dir_pages)}")
+
+    candidate_agency_sites = set()
+    for page in dir_pages[:120]:
+        html = fetch_html(page)
+        if not html:
+            continue
+        candidate_agency_sites |= extract_candidate_websites_from_html(html)
+        time.sleep(SLEEP_SEC)
+
+        if len(candidate_agency_sites) >= 600:
+            break
+
+    # Convert to a bounded list
+    agency_homepages = list(candidate_agency_sites)
+    random.shuffle(agency_homepages)
+    agency_homepages = agency_homepages[:MAX_AGENCY_DOMAINS]
+
     print(f"Agency candidate domains: {len(agency_homepages)}")
 
     for u in agency_homepages:
-        consider_homepage("Agency", u)
+        add_lead("Agency", u)
 
     # -------------------------
-    # Write
+    # Write results
     # -------------------------
     if new_rows:
         append_rows(svc, sheet_id, new_rows)
