@@ -11,22 +11,20 @@ from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build as gbuild
 
 # ============================================================
-# FAST MODE CONFIG
+# CONFIG
 # ============================================================
 SHEET_NAME = "Pipeline"
 
-# Keep these tight for speed
+CC_LIMIT_PER_QUERY = 160
 MAX_DTC_TO_ADD = 60
 MAX_AGENCY_TO_ADD = 60
 
-# Common Crawl (free) – keep small so we don't stall
-CC_LIMIT_PER_QUERY = 120
-CC_MAX_RETRIES = 2          # FAST MODE: fewer retries
-CC_TIMEOUT_SEC = 15         # FAST MODE: shorter network timeout
+SLEEP_SEC = 0.25
+
+CC_TIMEOUT_SEC = 15
+CC_MAX_RETRIES = 2
 CC_BACKOFF_BASE = 1.4
 CC_JITTER = 0.4
-
-SLEEP_SEC = 0.25
 
 DEFAULT_STAGE = "Lead Identified"
 DEFAULT_FOLLOW_UP_STATUS = "Not Started"
@@ -39,15 +37,14 @@ BAD_DOMAINS = {
 }
 
 # ============================================================
-# DTC FILTERS (reduce junk)
+# DTC HEURISTICS
 # ============================================================
 SHOPIFY_RE = re.compile(r"(cdn\.shopify\.com|myshopify\.com|Shopify)", re.I)
 PASSWORD_RE = re.compile(r"(enter store using password|opening soon|password)", re.I)
 GENERIC_DEV_RE = re.compile(r"(example store|test store|coming soon)", re.I)
 
-# "Legit store" hints
 CART_RE = re.compile(r"(/cart|add to cart|checkout)", re.I)
-PRODUCT_RE = re.compile(r"(/products/|product__|product-form|schema\.org/Product)", re.I)
+PRODUCT_RE = re.compile(r"(/products/|schema\.org/Product|product-form|product__)", re.I)
 
 SIGNALS = {
     "meta_pixel": re.compile(r"connect\.facebook\.net|fbq\(", re.I),
@@ -62,10 +59,10 @@ SIGNALS = {
 }
 
 # ============================================================
-# AGENCY FILTERS
+# AGENCY HEURISTICS
 # ============================================================
 AGENCY_KEYWORDS = re.compile(
-    r"(case studies|portfolio|clients|our work|work|results|testimonials|"
+    r"(case studies|portfolio|clients|our work|results|testimonials|"
     r"paid social|meta ads|facebook ads|tiktok ads|performance marketing|"
     r"creative strategy|ugc|creative testing|ecommerce|shopify|dtc)",
     re.I
@@ -99,7 +96,7 @@ def fetch_html(url: str, timeout=18) -> str:
         r = requests.get(
             url,
             timeout=timeout,
-            headers={"User-Agent": "Mozilla/5.0 (compatible; AP-LeadGen/FAST/1.0)"},
+            headers={"User-Agent": "Mozilla/5.0 (compatible; AP-LeadGen/FAST/1.1)"},
             allow_redirects=True,
         )
         if r.status_code >= 400:
@@ -127,34 +124,37 @@ def extract_canonical_domain(html: str) -> str | None:
     return None
 
 
-def is_legit_dtc(domain: str, html: str) -> tuple[bool, str]:
+def dtc_quality(domain: str, html: str) -> tuple[bool, str, int]:
     """
-    FAST MODE quality gates:
-    - Shopify present
-    - not password/coming soon/test store
-    - not myshopify.com as final domain
-    - has at least 1 marketing signal
-    - has at least 1 commerce hint (cart or product schema/page)
+    Two-tier legit filter:
+    - Must be Shopify + not password/dev + not myshopify domain
+    - Must have >=1 marketing signal
+    - Tier 1: also has storefront hints (cart or product)
+    - Tier 2: allow missing storefront hints (some sites hide this in JS)
+    Returns: (ok, reason, tier)
     """
     if not html:
-        return False, "no_html"
+        return False, "no_html", 0
     if not SHOPIFY_RE.search(html):
-        return False, "not_shopify"
+        return False, "not_shopify", 0
     if PASSWORD_RE.search(html):
-        return False, "password_or_coming_soon"
+        return False, "password_or_coming_soon", 0
     if GENERIC_DEV_RE.search(html):
-        return False, "dev_store_text"
+        return False, "dev_store_text", 0
     if domain.endswith(".myshopify.com"):
-        return False, "myshopify_domain"
+        return False, "myshopify_domain", 0
 
     sig = detect_signals(html)
-    if signal_count(sig) < 1:
-        return False, "no_marketing_signals"
+    sc = signal_count(sig)
+    if sc < 1:
+        return False, "no_marketing_signals", 0
 
-    if not (CART_RE.search(html) or PRODUCT_RE.search(html)):
-        return False, "no_storefront_hints"
+    has_storefront = bool(CART_RE.search(html) or PRODUCT_RE.search(html))
+    if has_storefront:
+        return True, f"tier1 signals={sc}", 1
 
-    return True, f"signals={signal_count(sig)}"
+    # Tier 2 (looser, still legit enough)
+    return True, f"tier2 signals={sc}", 2
 
 
 # ============================================================
@@ -200,31 +200,26 @@ def row_for_pipeline(
     budget_fit: str,
     notes: str,
 ):
-    """
-    Your headers A..Y, with Q..V left BLANK per your request.
-    """
+    # Q..V blank per your request
     return [
-        lead_type,                    # A
-        company[:120],                # B
-        website,                      # C
-        "", "", "", "",               # D-G
-        "", "",                       # H-I
-        current_creative_style[:250], # J
-        observed_weakness[:250],      # K
-        DEFAULT_PERSONA_DEPTH,        # L
-        "",                           # M
-        "",                           # N
-        budget_fit,                   # O
-        DEFAULT_STAGE,                # P
-        "", "", "", "", "", "",       # Q-V blank
-        "",                           # W
-        notes[:700],                  # X
-        DEFAULT_FOLLOW_UP_STATUS      # Y
+        lead_type, company[:120], website,
+        "", "", "", "",                      # D-G
+        "", "",                              # H-I
+        current_creative_style[:250],        # J
+        observed_weakness[:250],             # K
+        DEFAULT_PERSONA_DEPTH,               # L
+        "", "",                              # M-N
+        budget_fit,                          # O
+        DEFAULT_STAGE,                       # P
+        "", "", "", "", "", "",              # Q-V blank
+        "",                                  # W
+        notes[:700],                         # X
+        DEFAULT_FOLLOW_UP_STATUS             # Y
     ]
 
 
 # ============================================================
-# Common Crawl (FAST MODE)
+# Common Crawl (FAST)
 # ============================================================
 def cc_latest_index_id() -> str:
     r = requests.get("https://index.commoncrawl.org/collinfo.json", timeout=20)
@@ -241,7 +236,7 @@ def cc_request(index_id: str, params: dict):
         try:
             r = requests.get(endpoint, params=params, timeout=CC_TIMEOUT_SEC)
             if r.status_code == 404:
-                return []  # no results
+                return []
             if r.status_code in transient:
                 backoff = (CC_BACKOFF_BASE ** attempt) + random.random() * CC_JITTER
                 print(f"[CC] transient {r.status_code} attempt {attempt}/{CC_MAX_RETRIES} for {params.get('url')}; sleep {backoff:.2f}s")
@@ -259,23 +254,16 @@ def cc_request(index_id: str, params: dict):
                 except Exception:
                     continue
             return urls
-
         except Exception as e:
             backoff = (CC_BACKOFF_BASE ** attempt) + random.random() * CC_JITTER
             print(f"[CC] error attempt {attempt}/{CC_MAX_RETRIES} for {params.get('url')}: {e}; sleep {backoff:.2f}s")
             time.sleep(backoff)
 
-    # FAST MODE: give up quickly
     return []
 
 
 def cc_search_wild(index_id: str, wild_pattern: str, limit: int) -> list[str]:
-    params = {
-        "url": wild_pattern,
-        "output": "json",
-        "limit": str(limit),
-        "collapse": "urlkey",
-    }
+    params = {"url": wild_pattern, "output": "json", "limit": str(limit), "collapse": "urlkey"}
     return cc_request(index_id, params)
 
 
@@ -283,9 +271,7 @@ def homepages_from_urls(urls: list[str], max_domains: int) -> list[str]:
     out, seen = [], set()
     for u in urls:
         d = norm_domain(u)
-        if not d or d in seen:
-            continue
-        if d in BAD_DOMAINS:
+        if not d or d in seen or d in BAD_DOMAINS:
             continue
         out.append(f"https://{d}/")
         seen.add(d)
@@ -295,17 +281,13 @@ def homepages_from_urls(urls: list[str], max_domains: int) -> list[str]:
 
 
 # ============================================================
-# Agency discovery fallback (DDG via ddgs if installed)
+# DDG fallback (robust import)
 # ============================================================
-def ddg_search_domains(queries: list[str], max_results_per_query: int = 15) -> set:
-    """
-    Free-ish fallback: DDG via ddgs package.
-    If ddgs isn't installed or fails (rate-limit), returns empty set.
-    """
+def ddg_search_domains(queries: list[str], max_results_per_query: int = 18) -> set:
     try:
         from ddgs import DDGS
-    except Exception:
-        print("[DDG] ddgs not installed; skipping DDG fallback.")
+    except Exception as e:
+        print(f"[DDG] ddgs not available; skipping. err={e}")
         return set()
 
     domains = set()
@@ -343,18 +325,18 @@ def main():
     index_id = cc_latest_index_id()
     print(f"Using Common Crawl index: {index_id}")
 
-    rows_to_add = []
+    rows = []
 
     # ----------------------------
-    # 1) DTC (Common Crawl seed -> canonical domain -> strict legit filter)
+    # DTC: seed via myshopify -> canonical -> quality tiers
     # ----------------------------
     dtc_seed = cc_search_wild(index_id, "*.myshopify.com/*", limit=CC_LIMIT_PER_QUERY)
     dtc_candidates = homepages_from_urls(dtc_seed, max_domains=120)
     print(f"DTC candidate domains (seeded): {len(dtc_candidates)}")
 
-    dtc_added = 0
+    added_dtc = 0
     for homepage in dtc_candidates:
-        if dtc_added >= MAX_DTC_TO_ADD:
+        if added_dtc >= MAX_DTC_TO_ADD:
             break
 
         d = norm_domain(homepage)
@@ -365,7 +347,6 @@ def main():
         if not html:
             continue
 
-        # switch to canonical storefront domain if possible
         canon = extract_canonical_domain(html)
         if canon and canon != d and canon not in BAD_DOMAINS and not canon.endswith(".myshopify.com"):
             html2 = fetch_html(f"https://{canon}/")
@@ -374,7 +355,7 @@ def main():
                 d = canon
                 html = html2
 
-        ok, reason = is_legit_dtc(d, html)
+        ok, reason, tier = dtc_quality(d, html)
         if not ok:
             continue
 
@@ -387,33 +368,23 @@ def main():
         lead_id = stable_id("DTC", d)
         notes = f"id={lead_id} | {reason}"
 
-        rows_to_add.append(
-            row_for_pipeline(
-                lead_type="DTC",
-                company=d,
-                website=homepage,
-                current_creative_style=current_style,
-                observed_weakness=weakness,
-                budget_fit=budget_fit,
-                notes=notes,
-            )
-        )
+        rows.append(row_for_pipeline("DTC", d, homepage, current_style, weakness, budget_fit, notes))
         existing.add(d)
-        dtc_added += 1
+        added_dtc += 1
         time.sleep(SLEEP_SEC)
 
-    print(f"DTC added this run: {dtc_added}")
+    print(f"DTC added this run: {added_dtc}")
 
     # ----------------------------
-    # 2) Agencies (FAST): use DDG fallback + validate homepage keywords
+    # Agencies: DDG fallback + validate homepage content
     # ----------------------------
     agency_domains = ddg_search_domains(AGENCY_SEARCH_QUERIES, max_results_per_query=18)
     agency_homepages = [f"https://{d}/" for d in agency_domains if d and d not in BAD_DOMAINS]
     random.shuffle(agency_homepages)
 
-    agency_added = 0
+    added_agency = 0
     for homepage in agency_homepages:
-        if agency_added >= MAX_AGENCY_TO_ADD:
+        if added_agency >= MAX_AGENCY_TO_ADD:
             break
 
         d = norm_domain(homepage)
@@ -427,7 +398,6 @@ def main():
         if not AGENCY_KEYWORDS.search(html):
             continue
 
-        # Minimal label
         hits = []
         for kw in ["case studies", "portfolio", "clients", "paid social", "meta ads", "tiktok ads", "creative strategy", "ugc"]:
             if re.search(kw, html, re.I):
@@ -439,29 +409,16 @@ def main():
         lead_id = stable_id("Agency", d)
         notes = f"id={lead_id} | source=ddg"
 
-        rows_to_add.append(
-            row_for_pipeline(
-                lead_type="Agency",
-                company=d,
-                website=homepage,
-                current_creative_style=current_style,
-                observed_weakness=weakness,
-                budget_fit=budget_fit,
-                notes=notes,
-            )
-        )
+        rows.append(row_for_pipeline("Agency", d, homepage, current_style, weakness, budget_fit, notes))
         existing.add(d)
-        agency_added += 1
+        added_agency += 1
         time.sleep(SLEEP_SEC)
 
-    print(f"Agency added this run: {agency_added}")
+    print(f"Agency added this run: {added_agency}")
 
-    # ----------------------------
-    # Write
-    # ----------------------------
-    if rows_to_add:
-        append_rows(svc, sheet_id, rows_to_add)
-        print(f"Added {len(rows_to_add)} new leads total.")
+    if rows:
+        append_rows(svc, sheet_id, rows)
+        print(f"Added {len(rows)} new leads total.")
     else:
         print("No new leads found this run.")
 
