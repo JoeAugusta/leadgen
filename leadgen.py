@@ -4,7 +4,6 @@ import re
 import time
 import hashlib
 import random
-from datetime import datetime, timezone
 from urllib.parse import urlparse
 
 import requests
@@ -16,11 +15,11 @@ from googleapiclient.discovery import build as gbuild
 # =========================================
 SHEET_NAME = "Pipeline"
 
-CC_LIMIT_PER_QUERY = 250
+CC_LIMIT_PER_QUERY = 350
 MAX_DTC_DOMAINS = 120
-MAX_AGENCY_DOMAINS = 120
+MAX_AGENCY_DOMAINS = 140
 
-SLEEP_SEC = 0.45
+SLEEP_SEC = 0.4
 
 CC_MAX_RETRIES = 4
 CC_BACKOFF_BASE_SEC = 1.35
@@ -34,18 +33,10 @@ BAD_DOMAINS = {
     "facebook.com", "instagram.com", "tiktok.com", "twitter.com", "x.com",
     "linkedin.com", "youtube.com", "pinterest.com", "snapchat.com", "reddit.com",
     "google.com", "shop.app", "apps.apple.com", "play.google.com",
-    "webflow.com", "wixsite.com", "squarespace.com"
 }
 
-AGENCY_DIRECTORY_PREFIXES = [
-    "https://clutch.co/agencies",
-    "https://themanifest.com",
-    "https://www.designrush.com/agency",
-    "https://sortlist.com",
-]
-
 # =========================================
-# SIGNALS / HEURISTICS
+# DTC SIGNALS / FILTERS
 # =========================================
 SHOPIFY_RE = re.compile(r"cdn\.shopify\.com|myshopify\.com|Shopify", re.I)
 PASSWORD_RE = re.compile(r"password|enter store using password|opening soon", re.I)
@@ -89,7 +80,7 @@ def fetch_html(url: str, timeout=20) -> str:
         r = requests.get(
             url,
             timeout=timeout,
-            headers={"User-Agent": "Mozilla/5.0 (compatible; AP-LeadGen/1.1)"},
+            headers={"User-Agent": "Mozilla/5.0 (compatible; AP-LeadGen/1.2)"},
             allow_redirects=True,
         )
         if r.status_code >= 400:
@@ -108,47 +99,28 @@ def score_signal_count(sig: dict) -> int:
 
 
 def extract_canonical_domain(html: str) -> str | None:
-    """
-    Try to get real storefront domain from canonical or og:url
-    """
     m = re.search(r'<link[^>]+rel=["\']canonical["\'][^>]+href=["\']([^"\']+)["\']', html, re.I)
     if m:
         return norm_domain(m.group(1))
-
     m = re.search(r'<meta[^>]+property=["\']og:url["\'][^>]+content=["\']([^"\']+)["\']', html, re.I)
     if m:
         return norm_domain(m.group(1))
-
     return None
 
 
 def is_legit_dtc_store(domain: str, html: str) -> tuple[bool, str]:
-    """
-    Quality filter for DTC:
-    - must be Shopify-like
-    - must NOT be password/opening soon
-    - must NOT be a bare myshopify.com domain as the public site
-    - must have at least one additional marketing/commerce signal (pixel/klaviyo/etc)
-    """
     if not html:
         return False, "no_html"
-
     if not SHOPIFY_RE.search(html):
         return False, "not_shopify"
-
     if PASSWORD_RE.search(html):
         return False, "password_or_coming_soon"
-
-    # If the actual site is a myshopify subdomain, it's very often dev/test
     if domain.endswith(".myshopify.com"):
         return False, "myshopify_subdomain"
-
     sig = detect_signals(html)
-    sig_count = score_signal_count(sig)
-    if sig_count < 1:
+    if score_signal_count(sig) < 1:
         return False, "no_tracking_signals"
-
-    return True, f"signals={sig_count}"
+    return True, "ok"
 
 
 # =========================================
@@ -199,43 +171,29 @@ def row_for_pipeline(
     notes: str,
     follow_up_status: str
 ):
-    """
-    Your headers A..Y.
-    Per your request: Q..V should be blank.
-    """
+    # Leaves Q..V blank per your request
     return [
-        lead_type,                    # A Lead Type
-        company[:120],                # B Company Name
-        website,                      # C Website
-        "",                           # D Primary Contact
-        "",                           # E Title
-        "",                           # F Email
-        "",                           # G LinkedIn
-        "",                           # H Estimated Monthly Ad Spend
-        "",                           # I Estimated Revenue
-        current_creative_style[:250], # J Current Creative Style
-        observed_weakness[:250],      # K Observed Weakness
-        persona_depth,                # L Persona Depth
-        current_agency,               # M Current Agency? (Y/N)
-        media_buyer_inhouse,          # N Media Buyer In-House? (Y/N)
-        budget_fit,                   # O Budget Fit
-        stage,                        # P Stage
-
-        "",                           # Q Deal Size ($)  <-- BLANK
-        "",                           # R Probability %  <-- BLANK
-        "",                           # S Weighted Value ($) <-- BLANK
-        "",                           # T First Contact Date <-- BLANK
-        "",                           # U Last Contact Date <-- BLANK
-        "",                           # V Next Follow-Up Date <-- BLANK
-
-        "",                           # W Days in Stage (formula recommended)
-        notes[:700],                  # X Notes
-        follow_up_status              # Y Follow-Up Status
+        lead_type,                    # A
+        company[:120],                # B
+        website,                      # C
+        "", "", "", "",               # D-G
+        "", "",                       # H-I
+        current_creative_style[:250], # J
+        observed_weakness[:250],      # K
+        persona_depth,                # L
+        current_agency,               # M
+        media_buyer_inhouse,          # N
+        budget_fit,                   # O
+        stage,                        # P
+        "", "", "", "", "", "",       # Q-V blank
+        "",                           # W
+        notes[:700],                  # X
+        follow_up_status              # Y
     ]
 
 
 # =========================================
-# Common Crawl (404 = empty results)
+# Common Crawl
 # =========================================
 def cc_latest_index_id() -> str:
     r = requests.get("https://index.commoncrawl.org/collinfo.json", timeout=25)
@@ -250,9 +208,8 @@ def request_with_retries(url: str, params: dict, timeout: int):
         try:
             r = requests.get(url, params=params, timeout=timeout)
 
-            # 404 means "no results"
             if r.status_code == 404:
-                return r
+                return r  # no results
 
             if r.status_code in transient:
                 backoff = (CC_BACKOFF_BASE_SEC ** attempt) + random.random() * CC_JITTER_SEC
@@ -271,39 +228,17 @@ def request_with_retries(url: str, params: dict, timeout: int):
     return None
 
 
-def cc_search_wild(index_id: str, wild_pattern: str, limit: int = 200) -> list[str]:
+def cc_search(index_id: str, url_value: str, match_type: str | None, limit: int) -> list[str]:
     endpoint = f"https://index.commoncrawl.org/{index_id}-index"
     params = {
-        "url": wild_pattern,
+        "url": url_value,
         "output": "json",
         "limit": str(limit),
         "collapse": "urlkey",
     }
-    r = request_with_retries(endpoint, params=params, timeout=45)
-    if r is None or r.status_code == 404:
-        return []
+    if match_type:
+        params["matchType"] = match_type
 
-    urls = []
-    for line in r.text.splitlines():
-        try:
-            obj = json.loads(line)
-            u = obj.get("url")
-            if u:
-                urls.append(u)
-        except Exception:
-            continue
-    return urls
-
-
-def cc_search_prefix(index_id: str, prefix_url: str, limit: int = 200) -> list[str]:
-    endpoint = f"https://index.commoncrawl.org/{index_id}-index"
-    params = {
-        "url": prefix_url,
-        "matchType": "prefix",
-        "output": "json",
-        "limit": str(limit),
-        "collapse": "urlkey",
-    }
     r = request_with_retries(endpoint, params=params, timeout=45)
     if r is None or r.status_code == 404:
         return []
@@ -336,32 +271,6 @@ def homepages_from_urls(urls: list[str], max_domains: int) -> list[str]:
 
 
 # =========================================
-# Agency extraction from directory HTML
-# =========================================
-def extract_candidate_websites_from_html(html: str) -> set:
-    urls = set(re.findall(r'https?://[^\s"\'<>]+', html))
-    cleaned = set()
-
-    for u in urls:
-        u = u.split("#")[0].split("?")[0]
-        d = norm_domain(u)
-        if not d or d in BAD_DOMAINS:
-            continue
-
-        # ignore the directory host itself
-        if any(d.endswith(norm_domain(p)) for p in AGENCY_DIRECTORY_PREFIXES):
-            continue
-
-        # ignore obvious outbound wrappers
-        if "clutch.co" in d or "themanifest.com" in d or "designrush.com" in d or "sortlist.com" in d:
-            continue
-
-        cleaned.add(f"https://{d}/")
-
-    return cleaned
-
-
-# =========================================
 # MAIN
 # =========================================
 def main():
@@ -369,7 +278,7 @@ def main():
     sa_json = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
 
     svc = sheets_client(sa_json)
-    existing_domains = get_existing_domains(svc, sheet_id)
+    existing = get_existing_domains(svc, sheet_id)
 
     index_id = cc_latest_index_id()
     print(f"Using Common Crawl index: {index_id}")
@@ -377,23 +286,22 @@ def main():
     new_rows = []
 
     def add_dtc(homepage_url: str):
-        nonlocal new_rows, existing_domains
+        nonlocal new_rows, existing
 
         domain = norm_domain(homepage_url)
-        if not domain or domain in existing_domains or domain in BAD_DOMAINS:
+        if not domain or domain in existing or domain in BAD_DOMAINS:
             return
 
         html = fetch_html(homepage_url)
         if not html:
             return
 
-        # If canonical points to a better domain, switch to it
+        # Try to switch from myshopify -> canonical storefront
         canon = extract_canonical_domain(html)
         if canon and canon != domain and canon not in BAD_DOMAINS and not canon.endswith(".myshopify.com"):
-            homepage_url2 = f"https://{canon}/"
-            html2 = fetch_html(homepage_url2)
+            html2 = fetch_html(f"https://{canon}/")
             if html2:
-                homepage_url = homepage_url2
+                homepage_url = f"https://{canon}/"
                 domain = canon
                 html = html2
 
@@ -405,10 +313,10 @@ def main():
         sig_list = [k.replace("_", " ").title() for k, v in sig.items() if v]
         current_creative_style = "Shopify + " + (", ".join(sig_list) if sig_list else "signals")
         observed_weakness = "Needs scalable creative testing + fatigue prevention"
-        budget_fit = "Med"  # leave conservative; refine later with spend estimation
+        budget_fit = "Med"
         lead_id = stable_id("DTC", domain)
 
-        notes = f"id={lead_id} | domain={domain} | {reason}"
+        notes = f"id={lead_id} | domain={domain} | {reason} | signals={len(sig_list)}"
 
         row = row_for_pipeline(
             lead_type="DTC",
@@ -426,34 +334,34 @@ def main():
         )
 
         new_rows.append(row)
-        existing_domains.add(domain)
+        existing.add(domain)
         time.sleep(SLEEP_SEC)
 
-    def add_agency(homepage_url: str):
-        nonlocal new_rows, existing_domains
+    def add_agency(homepage_url: str, source: str):
+        nonlocal new_rows, existing
 
         domain = norm_domain(homepage_url)
-        if not domain or domain in existing_domains or domain in BAD_DOMAINS:
+        if not domain or domain in existing or domain in BAD_DOMAINS:
             return
 
         html = fetch_html(homepage_url)
         if not html:
             return
 
-        # Validate as agency
         if not AGENCY_KEYWORDS.search(html):
             return
 
-        # Build style/weakness notes
         hits = []
         for kw in ["case studies", "portfolio", "clients", "paid social", "meta ads", "tiktok ads", "creative strategy", "ugc"]:
             if re.search(kw, html, re.I):
                 hits.append(kw)
+
         current_creative_style = "Agency: " + (", ".join(hits) if hits else "marketing services")
         observed_weakness = "Potential partner: creative overflow + testing system"
         budget_fit = "Med"
         lead_id = stable_id("Agency", domain)
-        notes = f"id={lead_id} | domain={domain} | source=directory"
+
+        notes = f"id={lead_id} | domain={domain} | source={source}"
 
         row = row_for_pipeline(
             lead_type="Agency",
@@ -471,13 +379,13 @@ def main():
         )
 
         new_rows.append(row)
-        existing_domains.add(domain)
+        existing.add(domain)
         time.sleep(SLEEP_SEC)
 
     # -------------------------
-    # DTC discovery (start from myshopify and convert to real domains)
+    # DTC discovery (wildcard that actually works)
     # -------------------------
-    dtc_seed_urls = cc_search_wild(index_id, "*.myshopify.com/*", limit=CC_LIMIT_PER_QUERY)
+    dtc_seed_urls = cc_search(index_id, "*.myshopify.com/*", match_type=None, limit=CC_LIMIT_PER_QUERY)
     dtc_homepages = homepages_from_urls(dtc_seed_urls, max_domains=MAX_DTC_DOMAINS)
     print(f"DTC candidate domains (seeded): {len(dtc_homepages)}")
 
@@ -485,35 +393,30 @@ def main():
         add_dtc(u)
 
     # -------------------------
-    # Agency discovery via directory pages
+    # Agency discovery (path mining that CC supports)
+    # We search by prefix for common agency pages across many domains.
     # -------------------------
-    dir_pages = []
-    for prefix in AGENCY_DIRECTORY_PREFIXES:
-        dir_pages += cc_search_prefix(index_id, prefix, limit=120)
+    agency_urls = []
 
-    dir_pages = list(dict.fromkeys(dir_pages))[:180]
-    print(f"Directory pages discovered: {len(dir_pages)}")
+    # These tend to exist on agencies and be indexed.
+    # NOTE: We use prefix match on "https://" plus path pieces by TLD buckets.
+    # This is a heuristic but works better than directory link extraction.
+    for tld in ["com", "io", "co", "agency", "net", "us", "ca", "uk", "au"]:
+        for path in ["/case-studies", "/portfolio", "/work", "/clients", "/our-work", "/services/paid-social"]:
+            prefix = f"https://*.{tld}{path}"
+            # CC doesn't support wildcard in prefix matchType, so we fallback to wild search style:
+            # Use non-prefix wildcard query for domain+path combinations.
+            agency_urls += cc_search(index_id, f"*.{tld}{path}*", match_type=None, limit=80)
 
-    candidate_agency_sites = set()
-    for page in dir_pages[:120]:
-        html = fetch_html(page)
-        if not html:
-            continue
-        candidate_agency_sites |= extract_candidate_websites_from_html(html)
-        time.sleep(SLEEP_SEC)
-        if len(candidate_agency_sites) >= 500:
-            break
-
-    agency_homepages = list(candidate_agency_sites)
-    random.shuffle(agency_homepages)
-    agency_homepages = agency_homepages[:MAX_AGENCY_DOMAINS]
-    print(f"Agency candidate domains (extracted): {len(agency_homepages)}")
+    # Convert to homepages
+    agency_homepages = homepages_from_urls(agency_urls, max_domains=MAX_AGENCY_DOMAINS)
+    print(f"Agency candidate domains (path-mined): {len(agency_homepages)}")
 
     for u in agency_homepages:
-        add_agency(u)
+        add_agency(u, source="cc_path_mining")
 
     # -------------------------
-    # Write results
+    # Write
     # -------------------------
     if new_rows:
         append_rows(svc, sheet_id, new_rows)
